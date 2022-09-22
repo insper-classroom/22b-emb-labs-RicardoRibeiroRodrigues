@@ -109,15 +109,19 @@ extern void vApplicationMallocFailedHook(void) {
 /************************************************************************/
 
 void but_callback(void) {
+	// Usando queue
 	uint32_t delay_inc = 100;
 	xQueueSendFromISR(xQueueIncFreq, &delay_inc, 0);
+	// Usando semaforos
 	// BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 	// xSemaphoreGiveFromISR(xSemaphoreBut, &xHigherPriorityTaskWoken);
 }
 
 void but_1_callback(void) {
+	// Usando queue
 	uint32_t delay_inc = 100;
 	xQueueSendFromISR(xQueueIncFreq, &delay_inc, 0);
+	// Usando semaforos
 	// BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 	// xSemaphoreGiveFromISR(xSemaphoreBut_1, &xHigherPriorityTaskWoken);	
 }
@@ -246,10 +250,10 @@ static void BUT_init(void) {
   
   // Configura handler para o botao 1 para interrupcao
   pio_handler_set(BUT_1_PIO,
-  BUT_1_PIO_ID,
-  BUT_1_IDX_MASK,
-  PIO_IT_FALL_EDGE,
-  but_1_callback);
+				  BUT_1_PIO_ID,
+				  BUT_1_IDX_MASK,
+				  PIO_IT_FALL_EDGE,
+				  but_1_callback);
   
   // Ativa interrupção e limpa primeira IRQ do botao 1 gerada na ativacao
   pio_enable_interrupt(BUT_1_PIO, BUT_1_IDX_MASK);
