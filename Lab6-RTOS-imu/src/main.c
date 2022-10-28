@@ -6,6 +6,7 @@
 #include "sysfont.h"
 #include <mcu6050.h>
 #include <math.h>
+#include <Fusion/Fusion.h>	
 
 
 /* Botao da placa */
@@ -39,6 +40,8 @@
 #define LED_3_IDX 2
 #define LED_3_IDX_MASK (1u << LED_3_IDX)
 
+typedef enum orientacao {ESQUERDA, FRENTE, DIREITA} orientacao;
+
 
 /** RTOS  */
 #define TASK_OLED_STACK_SIZE                (1024*6/sizeof(portSTACK_TYPE))
@@ -50,6 +53,9 @@
 #define TASK_HOUSED_STACK_SIZE                (1024*6/sizeof(portSTACK_TYPE))
 #define TASK_HOUSED_STACK_PRIORITY            (tskIDLE_PRIORITY)
 
+#define TASK_ORIENTA_STACK_SIZE                (1024*6/sizeof(portSTACK_TYPE))
+#define TASK_ORIENTA_STACK_PRIORITY            (tskIDLE_PRIORITY)
+
 extern void vApplicationStackOverflowHook(xTaskHandle *pxTask,  signed char *pcTaskName);
 extern void vApplicationIdleHook(void);
 extern void vApplicationTickHook(void);
@@ -57,6 +63,7 @@ extern void vApplicationMallocFailedHook(void);
 extern void xPortSysTickHandler(void);
 
 xSemaphoreHandle xSemaphoreLed;
+xQueueHandle xQueueOrientacao;
 
 /** prototypes */
 void but_callback(void);
@@ -66,6 +73,7 @@ int8_t mcu6050_i2c_bus_write(uint8_t dev_addr, uint8_t reg_addr, uint8_t *reg_da
 int8_t mcu6050_i2c_bus_read(uint8_t dev_addr, uint8_t reg_addr, uint8_t *reg_data, uint8_t cnt);
 float modulo(float a, float b, float c);
 void init(void);
+char is_in_range(float num, float lower, float upper);
 
 
 /************************************************************************/
@@ -115,7 +123,7 @@ static void task_imu(void *pvParameters) {
 	uint8_t bufferRX[10];
 	uint8_t bufferTX[10];
 
-	/* resultado da fun��o */
+	/* resultado da função */
 	uint8_t rtn;
 	
 	// Verificacao de coneccao
@@ -167,6 +175,10 @@ static void task_imu(void *pvParameters) {
 	volatile uint8_t  raw_gyr_xLow,  raw_gyr_yLow,  raw_gyr_zLow;
 	float proc_gyr_x, proc_gyr_y, proc_gyr_z;
 	
+	/* Inicializa Função de fusão */
+	FusionAhrs ahrs;
+	FusionAhrsInitialise(&ahrs);
+	
 	while(1) {
 		// Le valor do acc X High e Low
 		mcu6050_i2c_bus_read(MPU6050_DEFAULT_ADDRESS, MPU6050_RA_ACCEL_XOUT_H, &raw_acc_xHigh, 1);
@@ -211,13 +223,37 @@ static void task_imu(void *pvParameters) {
 		proc_gyr_y = (float)raw_gyr_y/131;
 		proc_gyr_z = (float)raw_gyr_z/131;
 		
-		printf("Acc: x: %f y: %f z: %f\n", proc_acc_x, proc_acc_y, proc_acc_z);
-		printf("Gyr: x: %f y: %f z: %f\n", proc_gyr_x, proc_gyr_y, proc_gyr_z);
-		
-		if (modulo(proc_acc_y, proc_acc_z, proc_acc_x) < 0.4) {
+		// printf("Acc: x: %f y: %f z: %f\n", proc_acc_x, proc_acc_y, proc_acc_z);
+		// printf("Gyr: x: %f y: %f z: %f\n", proc_gyr_x, proc_gyr_y, proc_gyr_z);
+		float valor_modulo = modulo(proc_acc_y, proc_acc_z, proc_acc_x);
+		if (valor_modulo < 0.3) {
 			xSemaphoreGive(xSemaphoreLed);
 		}
 		
+		const FusionVector gyroscope = {proc_gyr_x, proc_gyr_y, proc_gyr_z};
+		const FusionVector accelerometer = {proc_acc_x, proc_acc_y, proc_acc_z};
+			
+		// Tempo entre amostras
+		float dT = 0.1;
+
+		// aplica o algoritmo
+		FusionAhrsUpdateNoMagnetometer(&ahrs, gyroscope, accelerometer, dT);
+
+		// dados em pitch roll e yaw
+		const FusionEuler euler = FusionQuaternionToEuler(FusionAhrsGetQuaternion(&ahrs));
+
+		printf("Roll %0.1f, Pitch %0.1f, Yaw %0.1f\n", euler.angle.roll, euler.angle.pitch, euler.angle.yaw);
+		orientacao orient;
+		if (is_in_range(euler.angle.yaw, 30, 170)) {
+			orient = DIREITA;
+		} else if (is_in_range(euler.angle.yaw, -170, -20)) {
+			orient = ESQUERDA;
+		} else {
+			orient = FRENTE;
+		}
+		xQueueSend(xQueueOrientacao, &orient, 0);
+			
+	
 
 		// uma amostra a cada 1ms
 		vTaskDelay(1);
@@ -229,12 +265,34 @@ static void task_house_down(void *pvParameters) {
 	
 	while (1) {
 		if (xSemaphoreTake(xSemaphoreLed, 0) == pdPASS) {
-			pio_toggle_pin_group(LED_1_PIO, LED_1_IDX_MASK);
-			vTaskDelay(100 / portTICK_PERIOD_MS);
-			pio_toggle_pin_group(LED_1_PIO, LED_1_IDX_MASK);
+			pio_toggle_pin_group(LED_PIO, LED_PIO_IDX_MASK);
+			vTaskDelay(250 / portTICK_PERIOD_MS);
+			pio_toggle_pin_group(LED_PIO, LED_PIO_IDX_MASK);
 		}
 	}
 	
+}
+
+static void task_orienta(void *pvParamters) {
+	orientacao dado;
+	
+	while (1) {
+		 if (xQueueReceive(xQueueOrientacao, &dado, 0)) {
+			 if (dado == ESQUERDA) {
+				 pio_clear(LED_1_PIO, LED_1_IDX_MASK);
+				 pio_set(LED_2_PIO, LED_2_IDX_MASK);
+				 pio_set(LED_3_PIO, LED_3_IDX_MASK);
+			 } else if (dado == FRENTE) {
+				 pio_set(LED_1_PIO, LED_1_IDX_MASK);
+				 pio_clear(LED_2_PIO, LED_2_IDX_MASK);
+				 pio_set(LED_3_PIO, LED_3_IDX_MASK);
+			 } else {
+				 pio_set(LED_1_PIO, LED_1_IDX_MASK);
+				 pio_set(LED_2_PIO, LED_2_IDX_MASK);
+				 pio_clear(LED_3_PIO, LED_3_IDX_MASK);
+			 }
+		 }
+	}
 }
 
 /************************************************************************/
@@ -326,7 +384,7 @@ int8_t mcu6050_i2c_bus_read(uint8_t dev_addr, uint8_t reg_addr, uint8_t *reg_dat
 
 void init(void) {
 	pmc_enable_periph_clk(LED_PIO_ID);
-	pio_set_output(LED_PIO, LED_PIO_IDX_MASK, 0, 0, 0);
+	pio_set_output(LED_PIO, LED_PIO_IDX_MASK, 1, 0, 0);
 
 	// Configura led 1 do oled
 	pmc_enable_periph_clk(LED_1_PIO_ID);
@@ -340,6 +398,10 @@ void init(void) {
 	
 }
 
+char is_in_range(float num, float lower, float upper) {
+	return ((num <= upper) && (num >= lower));
+}
+
 /************************************************************************/
 /* main                                                                 */
 /************************************************************************/
@@ -349,12 +411,11 @@ int main(void) {
 	/* Initialize the SAM system */
 	sysclk_init();
 	board_init();
+	init();
 
 	/* Initialize the console uart */
 	configure_console();
 	
-	
-
 	/* Create task to control oled */
 	if (xTaskCreate(task_oled, "oled", TASK_OLED_STACK_SIZE, NULL, TASK_OLED_STACK_PRIORITY, NULL) != pdPASS) {
 	  printf("Failed to create oled task\r\n");
@@ -368,12 +429,19 @@ int main(void) {
 		printf("Failed to create THD task\r\n");
 	}
 	
+	if (xTaskCreate(task_orienta, "ORI", TASK_ORIENTA_STACK_SIZE, NULL, TASK_ORIENTA_STACK_PRIORITY, NULL) != pdPASS) {
+		printf("Failed to create ORI task\r\n");
+	}
+	
 	xSemaphoreLed = xSemaphoreCreateBinary();
+	
+	xQueueOrientacao = xQueueCreate(20, sizeof(orientacao));
 
 	/* Start the scheduler. */
 	vTaskStartScheduler();
+	
 
-  /* RTOS n�o deve chegar aqui !! */
+  /* RTOS não deve chegar aqui !! */
 	while(1){}
 
 	/* Will only get here if there was insufficient memory to create the idle task. */
