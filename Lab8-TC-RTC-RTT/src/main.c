@@ -35,6 +35,13 @@
 #define LED_3_IDX 2
 #define LED_3_IDX_MASK (1u << LED_3_IDX)
 
+// Configurações botao 1
+#define BUT_1_PIO PIOD
+#define BUT_1_PIO_ID ID_PIOD
+#define BUT_1_IDX 28
+#define BUT_1_IDX_MASK (1u << BUT_1_IDX)
+
+
 typedef struct  {
 	uint32_t year;
 	uint32_t month;
@@ -44,6 +51,12 @@ typedef struct  {
 	uint32_t minute;
 	uint32_t second;
 } calendar;
+
+typedef struct {
+	uint hour;
+	uint minute;
+	uint second;
+} horario;
 
 
 /** RTOS  */
@@ -55,6 +68,9 @@ extern void vApplicationIdleHook(void);
 extern void vApplicationTickHook(void);
 extern void vApplicationMallocFailedHook(void);
 extern void xPortSysTickHandler(void);
+
+SemaphoreHandle_t xSemaphoreLed;
+QueueHandle_t xQueueHorario;
 
 /** prototypes */
 void but_callback(void);
@@ -88,6 +104,20 @@ extern void vApplicationMallocFailedHook(void) {
 void but_callback(void) {
 }
 
+void but_1_callback(void) {
+		uint32_t current_hour, current_min, current_sec;
+		uint32_t current_year, current_month, current_day, current_week;
+		rtc_get_date(RTC, &current_year, &current_month, &current_day, &current_week);
+		rtc_get_time(RTC, &current_hour, &current_min, &current_sec);
+		current_sec += 20;
+		if (current_sec >= 60) {
+			current_min++;
+			current_sec -= 60;
+		}
+		rtc_set_date_alarm(RTC, 1, current_month, 1, current_day);
+		rtc_set_time_alarm(RTC, 1, current_hour, 1, current_min, 1, current_sec);
+}
+
 /**
 *  Interrupt handler for TC1 interrupt.
 */
@@ -99,7 +129,7 @@ void TC1_Handler(void) {
 	volatile uint32_t status = tc_get_status(TC0, 1);
 
 	/** Muda o estado do LED (pisca) **/
-	pio_toggle_pin_group(LED_PIO, LED_PIO_IDX_MASK);
+	pin_toggle(LED_PIO, LED_PIO_IDX_MASK);  
 }
 
 void TC0_Handler(void) {
@@ -107,10 +137,21 @@ void TC0_Handler(void) {
 	* Devemos indicar ao TC que a interrupção foi satisfeita.
 	* Isso é realizado pela leitura do status do periférico
 	**/
-	volatile uint32_t status = tc_get_status(TC0, 1);
+	volatile uint32_t status = tc_get_status(TC0, 0);
 
 	/** Muda o estado do LED (pisca) **/
-	pio_toggle_pin_group(LED_1_PIO, LED_1_IDX_MASK);
+	pin_toggle(LED_1_PIO, LED_1_IDX_MASK);
+}
+
+void TC2_Handler(void) {
+	/**
+	* Devemos indicar ao TC que a interrupção foi satisfeita.
+	* Isso é realizado pela leitura do status do periférico
+	**/
+	volatile uint32_t status = tc_get_status(TC0, 2);
+
+	/** Muda o estado do LED (pisca) **/
+	pin_toggle(LED_3_PIO, LED_3_IDX_MASK);
 }
 
 void RTT_Handler(void) {
@@ -120,7 +161,7 @@ void RTT_Handler(void) {
 	/* IRQ due to Alarm */
 	if ((ul_status & RTT_SR_ALMS) == RTT_SR_ALMS) {
 		pin_toggle(LED_2_PIO, LED_2_IDX_MASK);
-		// pio_toggle_pin_group(LED_2_PIO, LED_2_IDX_MASK);
+		RTT_init(10, 40, RTT_MR_ALMIEN);
 	}
 }
 
@@ -133,14 +174,26 @@ void RTC_Handler(void) {
 	
     /* seccond tick */
     if ((ul_status & RTC_SR_SEC) == RTC_SR_SEC) {	
-	// o código para irq de segundo vem aqui
+		// o código para irq de segundo vem aqui
+		uint32_t current_hour, current_min, current_sec;
+		rtc_get_time(RTC, &current_hour, &current_min, &current_sec);
+		horario atual = {current_hour, current_min, current_sec};
+		xQueueSendFromISR(xQueueHorario, &atual, 0);
     }
 	
     /* Time or date alarm */
     if ((ul_status & RTC_SR_ALARM) == RTC_SR_ALARM) {
     	// o código para irq de alame vem aqui
+		xSemaphoreGiveFromISR(xSemaphoreLed, 0);
+	
     }
-    
+	
+	rtc_clear_status(RTC, RTC_SCCR_SECCLR);
+    rtc_clear_status(RTC, RTC_SCCR_ALRCLR);
+    rtc_clear_status(RTC, RTC_SCCR_ACKCLR);
+    rtc_clear_status(RTC, RTC_SCCR_TIMCLR);
+    rtc_clear_status(RTC, RTC_SCCR_CALCLR);
+    rtc_clear_status(RTC, RTC_SCCR_TDERRCLR);
 }
 
 /************************************************************************/
@@ -149,11 +202,10 @@ void RTC_Handler(void) {
 
 static void task_oled(void *pvParameters) {
 	gfx_mono_ssd1306_init();
-	gfx_mono_draw_string("Exemplo RTOS", 0, 0, &sysfont);
-	gfx_mono_draw_string("oii", 0, 20, &sysfont);
-	
-	TC_init(TC0, ID_TC1, 1, 5);
-	TC_init(TC0, ID_TC0, 0, 4);
+	// Para piscar a 5 hz, tem que dar toggle a 10hz
+	TC_init(TC0, ID_TC1, 1, 10);
+	TC_init(TC0, ID_TC0, 0, 8);
+	TC_init(TC0, ID_TC2, 2, 5);
 	
 	tc_start(TC0, 1);
 	tc_start(TC0, 0);
@@ -161,12 +213,23 @@ static void task_oled(void *pvParameters) {
 	RTT_init(10, 40, RTT_MR_ALMIEN);
 	
 	/** Configura RTC */
-	calendar rtc_initial = {2022, 11, 17, 12, 11, 44, 50};
-	RTC_init(RTC, ID_RTC, rtc_initial, RTC_IER_ALREN);
+	calendar rtc_initial = {2022, 11, 11, 12, 15, 45, 1};
+	RTC_init(RTC, ID_RTC, rtc_initial, RTC_IER_ALREN | RTC_IER_SECEN);
 	
+	horario horario_atual;
+	printf("Comecou!\n");
 
 	for (;;)  {
-		// pmc_sleep(SAM_PM_SMODE_SLEEP_WFI);
+		if (xSemaphoreTake(xSemaphoreLed, 0) == pdTRUE) {
+			printf("Entra aqui\n");
+			tc_start(TC0, 2);
+		}
+		if (xQueueReceive(xQueueHorario, &horario_atual, 0)) {
+			char str[128];
+			sprintf(str, "%02d:%02d:%02d", horario_atual.hour, horario_atual.minute, horario_atual.second);
+			gfx_mono_draw_string(str, 40, 12, &sysfont);
+		}
+		pmc_sleep(SAM_PM_SMODE_SLEEP_WFI);
 	}
 }
 
@@ -199,6 +262,27 @@ static void BUT_init(void) {
 	pio_set_debounce_filter(BUT_PIO, BUT_PIO_PIN_MASK, 60);
 	pio_enable_interrupt(BUT_PIO, BUT_PIO_PIN_MASK);
 	pio_handler_set(BUT_PIO, BUT_PIO_ID, BUT_PIO_PIN_MASK, PIO_IT_FALL_EDGE , but_callback);
+	
+	pmc_enable_periph_clk(BUT_1_PIO_ID);
+	pio_set_input(BUT_1_PIO, BUT_1_IDX_MASK, PIO_DEFAULT | PIO_DEBOUNCE);
+	pio_pull_up(BUT_1_PIO, BUT_1_IDX_MASK, 1);
+
+	// Configura handler para o botao 1 para interrupcao
+	pio_handler_set(BUT_1_PIO,
+		BUT_1_PIO_ID,
+		BUT_1_IDX_MASK,
+		PIO_IT_FALL_EDGE,
+		but_1_callback);
+
+	// Ativa interrupção e limpa primeira IRQ do botao 1 gerada na ativacao
+	pio_enable_interrupt(BUT_1_PIO, BUT_1_IDX_MASK);
+	pio_get_interrupt_status(BUT_1_PIO);
+
+	// Configura NVIC para receber interrupcoes do PIO do botao 1
+	// com prioridade 4 (quanto mais próximo de 0 maior)
+	NVIC_EnableIRQ(BUT_1_PIO_ID);
+	NVIC_SetPriority(BUT_1_PIO_ID, 5);
+
 }
 
 void led_init(void) {
@@ -317,15 +401,30 @@ int main(void) {
 	/* Initialize the SAM system */
 	sysclk_init();
 	board_init();
+	
+	/* Disable the watchdog */
+	WDT->WDT_MR = WDT_MR_WDDIS;
 
 	/* Initialize the console uart */
 	configure_console();
+	BUT_init();
 	led_init();
-
+	
+	xSemaphoreLed = xSemaphoreCreateBinary();
+	if (xSemaphoreLed == NULL) {
+		printf("Failed to create semahpore led\r\n");
+	}
+	
+	xQueueHorario = xQueueCreate(32, sizeof(horario));
+	if (xQueueHorario == NULL){
+		printf("falha em criar a fila \n");
+	}
 	/* Create task to control oled */
 	if (xTaskCreate(task_oled, "oled", TASK_OLED_STACK_SIZE, NULL, TASK_OLED_STACK_PRIORITY, NULL) != pdPASS) {
 	  printf("Failed to create oled task\r\n");
 	}
+	
+	
 
 	/* Start the scheduler. */
 	vTaskStartScheduler();
